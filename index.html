@@ -409,7 +409,7 @@
     let phase = 'intro', cur = null, pendingBlank = false;
     for (const line of splitInlineLists(text).split('\n')) {
       // item = "1." / "1)" or any bullet/dash look-alike (-, •, ‑ non-breaking hyphen, − minus, – —, etc.)
-      let m = line.match(/^\s*(?:\d+[.)]|[-*•·●▪◦‐‑‒–—−])\s+(.*)$/);
+         let m = line.match(/^\s*(?:(?:\d+[.)]|[-*•·●▪◦‐‑‒–—−])\s+|\d\uFE0F?\u20E3\s*)(.*)$/);
       // or a line that starts with a **Bold Name** followed by a dash or colon
       if (!m) m = line.match(/^\s*(\*\*[^*]+\*\*\s*[–—‐‑−:-]\s*.*)$/);
       if (m) { phase = 'list'; cur = { text: m[1].trim() }; items.push(cur); pendingBlank = false; continue; }
