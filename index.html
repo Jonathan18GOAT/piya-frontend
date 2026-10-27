@@ -629,7 +629,13 @@
     // reuse an empty chat so we never pile up blank ones; old chats are kept
     let chat = state.chats.find(c => c.msgs.length === 0);
     if (!chat) {
-      chat = { id: uid(), title: 'New Chat', msgs: [], history: [] };
+      chat = {
+        id: uid(),
+        title: 'New Chat',
+        msgs: [],
+        history: [],
+        sessionId: null
+      };
       state.chats.unshift(chat);
     }
     state.activeId = chat.id;
@@ -647,7 +653,11 @@
 
   function deleteChat(id) {
     state.chats = state.chats.filter(c => c.id !== id);
-    if (state.activeId === id) { state.activeId = null; goHome(); return; }
+    if (state.activeId === id) {
+      state.activeId = null;
+      goHome();
+      return;
+    }
     save();
     renderSidebar();
   }
@@ -684,16 +694,28 @@
       const res = await fetch(API_URL, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ text, history: chat.history.slice(-MAX_HISTORY) })
+        body: JSON.stringify({
+          text,
+          session_id: chat.sessionId
+        })
       });
+
       let data = {};
       try { data = await res.json(); } catch (_) {}
+
       if (!res.ok) {
         console.error('Backend error:', res.status, data);
         reply = friendlyError(res.status, JSON.stringify(data));
         isError = true;
       } else {
         reply = data.reply || "Hmm, I got a bit tongue-tied. Can you say that again?";
+
+        // Save the backend-issued session ID for the next message
+        if (data.session_id) {
+          chat.sessionId = data.session_id;
+          save();
+        }
+
         chat.history.push({ role: 'user', content: text });
         chat.history.push({ role: 'assistant', content: reply });
       }
@@ -880,6 +902,11 @@
   [authName, authEmail, authPassword].forEach(el => el.addEventListener('keydown', e => { if (e.key === 'Enter') submitAuth(); }));
 
   // ====== START ======
+  // Ensure older saved chats also have sessionId after this update
+  state.chats.forEach(chat => {
+    if (!('sessionId' in chat)) chat.sessionId = null;
+  });
+
   if (!state.chats.length || !activeChat()) {
     state.activeId = state.chats.length ? state.chats[0].id : null;
   }
