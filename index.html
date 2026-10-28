@@ -141,6 +141,7 @@
   .center { width: 100%; max-width: 760px; text-align: center; display: flex; flex-direction: column; }
   .greeting {
     margin: 0 0 34px; color: var(--jade);
+    font-family: "Fredoka", "Trebuchet MS", system-ui, sans-serif;
     font-size: clamp(34px, 5.2vw, 58px); font-weight: 600; line-height: 1.15; letter-spacing: .3px;
   }
   .chips { display: flex; flex-wrap: wrap; justify-content: center; gap: 12px; margin-bottom: 38px; }
@@ -626,17 +627,15 @@
 
   // ====== CHAT ACTIONS ======
   function goHome() {
-    // reuse an empty chat so we never pile up blank ones; old chats are kept
+    // Reuse an empty chat; each chat gets its own temporary game session.
     let chat = state.chats.find(c => c.msgs.length === 0);
     if (!chat) {
-      chat = {
-        id: uid(),
-        title: 'New Chat',
-        msgs: [],
-        history: [],
-        sessionId: null
-      };
+      chat = { id: uid(), title: 'New Chat', msgs: [], history: [], sessionId: null, gameActive: false };
       state.chats.unshift(chat);
+    } else {
+      // Backfill fields for chats saved by an older frontend version.
+      if (typeof chat.sessionId === 'undefined') chat.sessionId = null;
+      if (typeof chat.gameActive === 'undefined') chat.gameActive = false;
     }
     state.activeId = chat.id;
     save();
@@ -646,6 +645,11 @@
   }
 
   function selectChat(id) {
+    const selected = state.chats.find(c => c.id === id);
+    if (selected) {
+      if (typeof selected.sessionId === 'undefined') selected.sessionId = null;
+      if (typeof selected.gameActive === 'undefined') selected.gameActive = false;
+    }
     state.activeId = id;
     save();
     setView('chat');
@@ -653,11 +657,7 @@
 
   function deleteChat(id) {
     state.chats = state.chats.filter(c => c.id !== id);
-    if (state.activeId === id) {
-      state.activeId = null;
-      goHome();
-      return;
-    }
+    if (state.activeId === id) { state.activeId = null; goHome(); return; }
     save();
     renderSidebar();
   }
@@ -671,6 +671,30 @@
     return "Oops, something went wrong on my side. Please try again!";
   }
 
+  // A game session is retained only while a game/round is in progress.
+  // These checks match the game-start and game-stop phrases handled by the backend.
+  function startsGame(text) {
+    return /\b(20 questions|twenty[ -]one questions|21 questions|akinator|rock paper scissors|rps)\b/i.test(text);
+  }
+
+  function stopsGame(text) {
+    return /\b(stop game|quit game|end game|cancel game|exit game)\b/i.test(text);
+  }
+
+  function gameHasFinished(reply, userText) {
+    const r = String(reply || '').toLowerCase();
+    const u = String(userText || '').toLowerCase();
+    if (stopsGame(u)) return true;
+    // These are terminal game replies. The "another round?" replies are
+    // intentionally kept alive so the backend can process the user's yes/no.
+    if (r.includes('game stopped')) return true;
+    if (r.includes("i couldn't guess it this time")) return true;
+    if (r.includes("i can't find another distinct question")) return true;
+    if (r.includes("we've reached the end of our 21 questions")) return true;
+    if (r.includes('thanks for playing! what would you like to talk about?')) return true;
+    return false;
+  }
+
   async function sendMessage(text) {
     text = (text || '').trim();
     if (!text || busy) return;
@@ -678,6 +702,14 @@
     if (!activeChat()) goHome();
 
     const chat = activeChat();
+    if (typeof chat.sessionId === 'undefined') chat.sessionId = null;
+    if (typeof chat.gameActive === 'undefined') chat.gameActive = false;
+    if (typeof chat.gameState === 'undefined') chat.gameState = null;
+
+    // Mark the session as a game session before sending the first game request.
+    if (startsGame(text)) chat.gameActive = true;
+    const stopRequested = stopsGame(text);
+
     busy = true;
     sendBtn.disabled = true;
     input.value = '';
@@ -691,18 +723,23 @@
 
     let reply, isError = false;
     try {
+      const payload = {
+        text,
+        history: chat.history.slice(-MAX_HISTORY)
+      };
+      // Send session_id only for an active game. Ordinary chats do not need
+      // a persistent backend session for game state.
+      if (chat.gameActive && chat.sessionId) payload.session_id = chat.sessionId;
+      // Send the game state back too, so the game survives server restarts.
+      if (chat.gameActive && chat.gameState) payload.game_state = chat.gameState;
+
       const res = await fetch(API_URL, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          text,
-          session_id: chat.sessionId
-        })
+        body: JSON.stringify(payload)
       });
-
       let data = {};
       try { data = await res.json(); } catch (_) {}
-
       if (!res.ok) {
         console.error('Backend error:', res.status, data);
         reply = friendlyError(res.status, JSON.stringify(data));
@@ -710,19 +747,32 @@
       } else {
         reply = data.reply || "Hmm, I got a bit tongue-tied. Can you say that again?";
 
-        // Save the backend-issued session ID for the next message
-        if (data.session_id) {
-          chat.sessionId = data.session_id;
-          save();
-        }
+        // Save the backend session ID only when a game is active.
+        if (chat.gameActive && data.session_id) chat.sessionId = data.session_id;
+        if (chat.gameActive) chat.gameState = data.game_state || null;
 
         chat.history.push({ role: 'user', content: text });
         chat.history.push({ role: 'assistant', content: reply });
+
+        // Drop game state as soon as the round/game is finished.
+        if (chat.gameActive && (data.game_active === false || gameHasFinished(reply, text))) {
+          chat.gameActive = false;
+          chat.sessionId = null;
+          chat.gameState = null;
+        }
       }
     } catch (err) {
-      console.error(err);
+      console.error('Chat request failed:', err);
       reply = "I can't reach my brain right now. Is the backend running?";
       isError = true;
+    }
+
+    // If a stop request failed at the network/API level, clear the local game
+    // marker too so the chat does not keep attaching an old game session.
+    if (stopRequested && isError) {
+      chat.gameActive = false;
+      chat.sessionId = null;
+      chat.gameState = null;
     }
 
     chat.msgs.push({ role: 'piya', text: reply, error: isError });
@@ -901,12 +951,13 @@
   authSubmit.addEventListener('click', submitAuth);
   [authName, authEmail, authPassword].forEach(el => el.addEventListener('keydown', e => { if (e.key === 'Enter') submitAuth(); }));
 
-  // ====== START ======
-  // Ensure older saved chats also have sessionId after this update
+  // Add session fields to chats saved by older versions of the frontend.
   state.chats.forEach(chat => {
-    if (!('sessionId' in chat)) chat.sessionId = null;
+    if (typeof chat.sessionId === 'undefined') chat.sessionId = null;
+    if (typeof chat.gameActive === 'undefined') chat.gameActive = false;
   });
 
+  // ====== START ======
   if (!state.chats.length || !activeChat()) {
     state.activeId = state.chats.length ? state.chats[0].id : null;
   }
